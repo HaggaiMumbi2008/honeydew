@@ -8,6 +8,7 @@ use honeydew_audio::device::{
     AudioCommand, AudioOutput, AudioRenderer, BufferMode, OutputSnapshot,
 };
 use honeydew_audio::sample::SampleData;
+use honeydew_audio::stream::PreviewStream;
 
 use crate::audio_engine::{LiveInput, SongAudioEngine, settings, strip_param};
 use crate::sample_cache::{Reader, SampleCache};
@@ -237,6 +238,8 @@ pub struct AudioLink {
     /// Each sample a `Preview` sent, kept until the engine has let go of it ([`Self::poll`]), so the audio thread never
     /// frees one: the picker's strip may drop its own first.
     previews: Vec<Arc<SampleData>>,
+    /// Each disk stream a `PreviewStream` sent, kept until the engine has let go of it ([`Self::poll`]).
+    preview_streams: Vec<Arc<PreviewStream>>,
     /// The playhead the editors draw ([`Self::advance_playhead`]), and how far it runs ahead of the last snapshot.
     clock: clock::PlayheadClock,
     lead: u64,
@@ -347,6 +350,14 @@ impl AudioLink {
                 if !self.previews.iter().any(|p| Arc::ptr_eq(p, data)) =>
             {
                 self.previews.push(Arc::clone(data))
+            }
+            AudioCommand::PreviewStream(Some(ref stream))
+                if !self
+                    .preview_streams
+                    .iter()
+                    .any(|p| Arc::ptr_eq(p, stream)) =>
+            {
+                self.preview_streams.push(Arc::clone(stream))
             }
             AudioCommand::SetParam {
                 channel,
@@ -701,6 +712,8 @@ impl AudioLink {
     pub fn poll(&mut self) -> Option<OutputSnapshot> {
         // The previews the engine (and any command still queued) let go of are freed here, on this thread.
         self.previews.retain(|d| Arc::strong_count(d) > 1);
+        self.preview_streams
+            .retain(|stream| Arc::strong_count(stream) > 1);
         let mut snapshot = self.sink.as_mut().map(|s| s.snapshot());
         let failed = snapshot.as_ref().is_some_and(|s| s.stream_failed);
         if failed && !self.stream_failed {
@@ -998,6 +1011,10 @@ pub(crate) mod testing {
                 format!("Preview {} frames from {from}", data.frames())
             }
             AudioCommand::Preview(None) => "Preview stop".into(),
+            AudioCommand::PreviewStream(Some(stream)) => {
+                format!("Preview stream {} frames", stream.frames())
+            }
+            AudioCommand::PreviewStream(None) => "Preview stream stop".into(),
             AudioCommand::SetTempo(bpm) => format!("SetTempo {bpm:.3}"),
             AudioCommand::LiveParam {
                 channel,

@@ -460,6 +460,30 @@ impl PresetPicker {
         self.held_plays = plays;
     }
 
+    /// Updates the picked strip after its decode, preserving a stream that has already started.
+    pub fn update_sample(&mut self, name: String, wave: Option<Waveform>) {
+        if let Some(strip) = self
+            .panel
+            .sample
+            .as_mut()
+            .filter(|strip| strip.name == name)
+        {
+            strip.set_wave(wave);
+        } else {
+            self.set_sample(SampleStrip::new(name, wave));
+        }
+    }
+
+    /// Starts a progressive sample preview on the current strip.
+    pub fn play_sample_stream(
+        &mut self,
+        stream: std::sync::Arc<honeydew_audio::stream::PreviewStream>,
+    ) {
+        if let Some(strip) = &mut self.panel.sample {
+            strip.play_stream(stream);
+        }
+    }
+
     /// The name the sample strip shows, if it shows one.
     #[cfg(test)]
     pub(crate) fn sample_name(&self) -> Option<&str> {

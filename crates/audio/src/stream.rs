@@ -1048,6 +1048,74 @@ impl Streamer {
     }
 }
 
+/// A sample-picker preview that reads a supported disk sample as it plays.
+///
+/// The first half-second is held in memory so playback can start while the full sample is decoded for the song cache.
+/// A background streamer fills the remaining frames as the preview advances.
+pub struct PreviewStream {
+    sample: Arc<Streamed>,
+    rings: Arc<Rings>,
+    _streamer: Streamer,
+}
+
+impl std::fmt::Debug for PreviewStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreviewStream")
+            .field("frames", &self.frames())
+            .field("sample_rate", &self.sample_rate())
+            .finish()
+    }
+}
+
+impl PreviewStream {
+    /// Opens a PCM WAV or FLAC sample for progressive preview. Unsupported formats return `None` and use the normal
+    /// decoded-sample preview instead.
+    pub fn open(path: &Path) -> Option<Arc<Self>> {
+        let source = Source::open(path)?;
+        let sample = Arc::new(Streamed::new(source, &[0])?);
+        let rings = Rings::new(vec![Some(Arc::clone(&sample))])?;
+        let streamer = Streamer::spawn();
+        streamer.register(&rings);
+        Some(Arc::new(Self {
+            sample,
+            rings,
+            _streamer: streamer,
+        }))
+    }
+
+    pub fn frames(&self) -> usize {
+        self.sample.source.frames
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample.source.rate
+    }
+
+    /// Starts this preview's one voice at `from`.
+    pub fn start(&self, from: usize) {
+        self.rings.start(0, 0, from, false);
+    }
+
+    /// Stops its voice and lets the background reader release the file.
+    pub fn stop(&self) {
+        self.rings.stop(0);
+    }
+
+    /// The frame at `frame`; `None` means the background streamer has not filled it yet.
+    pub fn frame(&self, frame: usize) -> Option<(f32, f32)> {
+        self.rings.frame(0, frame)
+    }
+
+    /// Lets the streamer discard frames behind the playback position.
+    pub fn advance(&self, frame: usize) {
+        self.rings.advance(0, frame);
+    }
+
+    pub fn underrun(&self) {
+        self.rings.underrun();
+    }
+}
+
 fn run(hub: Weak<Hub>) {
     loop {
         let Some(live) = hub.upgrade() else {

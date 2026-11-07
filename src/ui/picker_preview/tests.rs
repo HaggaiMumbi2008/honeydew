@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use eframe::egui::{pos2, vec2};
 use honeydew_audio::sample::SampleData;
+use honeydew_audio::stream::PreviewStream;
 
 use super::*;
 
@@ -126,6 +127,28 @@ fn a_sample_strip_plays_its_pick_from_the_start_once_decoded_and_stops_once() {
     let mut none = SampleStrip::new("Broken".into(), None);
     assert!(!none.playing());
     assert_eq!(none.take_plays(), []);
+}
+
+#[test]
+fn a_streaming_sample_starts_early_and_full_decode_does_not_restart_it() {
+    let path = std::env::temp_dir().join(format!(
+        "honeydew-picker-preview-{}.wav",
+        std::process::id()
+    ));
+    let frames = vec![0.25; 48_000];
+    let bytes = honeydew_audio::wav_writer::float32_wav(48_000, &[frames]);
+    std::fs::write(&path, bytes).unwrap();
+    let stream = PreviewStream::open(&path).expect("a disk WAV streams");
+    let mut strip = SampleStrip::new("Kick".into(), None);
+
+    strip.play_stream(Arc::clone(&stream));
+    assert_eq!(strip.take_plays(), [Play::Streaming(Arc::clone(&stream))]);
+    strip.set_wave(Some(wave(48_000)));
+    assert_eq!(strip.take_plays(), [], "decoding completion does not restart playback");
+
+    strip.stop();
+    assert_eq!(strip.take_plays(), [Play::Stop]);
+    stream.stop();
 }
 
 #[test]

@@ -9,6 +9,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::MeterSnapshot;
 use crate::sample::SampleData;
+use crate::stream::PreviewStream;
 
 /// A callback renders in sub-blocks of at most this many frames, and publishes each one's meters and analyses as a
 /// visual frame of its own ([`MeterBank`]): the panels move several times a callback, whatever the buffer size.
@@ -146,6 +147,8 @@ pub trait AudioRenderer: Send + 'static {
     /// Plays `sample` once from frame `from`, past the master, replacing any preview playing; `None` stops it (the
     /// pickers' sample preview). The default plays nothing.
     fn preview(&mut self, _sample: Option<(Arc<SampleData>, usize)>) {}
+    /// Progressively plays a disk sample, replacing any preview playing; `None` stops it.
+    fn preview_stream(&mut self, _sample: Option<Arc<PreviewStream>>) {}
     /// The keys sounding at `channel`'s input (bit k = MIDI k): a note-on that reaches the channel before its note
     /// effects sets its key, the note-off clears it. The default: none.
     fn sounding(&self, _channel: usize) -> u128 {
@@ -224,6 +227,8 @@ pub enum AudioCommand<R> {
     },
     /// [`AudioRenderer::preview`].
     Preview(Option<(Arc<SampleData>, usize)>),
+    /// [`AudioRenderer::preview_stream`].
+    PreviewStream(Option<Arc<PreviewStream>>),
     /// [`AudioRenderer::set_tempo`].
     SetTempo(f32),
     /// [`AudioRenderer::set_live_param`].
@@ -1118,6 +1123,7 @@ impl<R: AudioRenderer> CallbackState<R> {
                         self.renderer.set_live_lane(channel, notes)
                     }
                     AudioCommand::Preview(sample) => self.renderer.preview(sample),
+                    AudioCommand::PreviewStream(sample) => self.renderer.preview_stream(sample),
                     AudioCommand::SetTempo(bpm) => self.renderer.set_tempo(bpm),
                     AudioCommand::LiveParam {
                         channel,

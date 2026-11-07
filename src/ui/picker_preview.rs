@@ -10,11 +10,13 @@
 //!
 //! **Sample strip.** 1.75 U at the bottom of the panel, `menuFill`: the play button (icon 3, 1.2 U, centred in a 2 U
 //! column), the waveform (from x + 2 U, max(W − 2.4 U, 0) wide, 1 U tall, `text` at 0.85), and under it the sample's
-//! name and its progress in a 5 : 1 width. It plays the pick once from the start; the play button (or the play key)
-//! stops or plays from the start, a touch on the waveform stops and its release plays from there. The waveform sits
-//! 0.125 U below the strip's top, the labels fill the rest; the progress is the position as m:ss (0:00 while stopped).
+//! name and its progress in a 5 : 1 width. PCM WAV and FLAC picks start streaming once their first frames are ready;
+//! other formats play once decoded. The play button (or play key) stops or plays from the start, a touch on the
+//! waveform stops and its release plays from there. The waveform sits 0.125 U below the strip's top, the labels fill
+//! the rest; the progress is the position as m:ss (0:00 while stopped).
 
 use eframe::egui::{Align2, Id, Mesh, Painter, Rect, Sense, Ui, pos2, vec2};
+use honeydew_audio::stream::PreviewStream;
 
 use crate::icons::{IconId, draw_icon};
 use crate::metrics::FontSize;
@@ -155,22 +157,39 @@ const WAVE_TOP: f32 = 0.125;
 const NAME_SHARE: f32 = 5.0 / 6.0;
 
 /// What the sample strip asks of the preview player.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Play {
     /// Play the sample once from this frame.
     From(usize),
+    /// Progressively play a supported disk sample.
+    Streaming(std::sync::Arc<PreviewStream>),
     Stop,
 }
+
+impl PartialEq for Play {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::From(a), Self::From(b)) => a == b,
+            (Self::Streaming(a), Self::Streaming(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::Stop, Self::Stop) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Play {}
 
 /// The sample strip of a sample picker: the last pick, played on the preview player.
 pub struct SampleStrip {
     pub name: String,
-    /// The decoded sample; `None` while it loads or when it does not decode: no play button, waveform or progress.
+    /// The decoded sample; `None` while it loads or when it does not decode.
     pub wave: Option<Waveform>,
     /// While it plays: when it started (egui seconds; `None` until its first frame) and from which frame.
     playing: Option<(Option<f64>, usize)>,
     /// A touch on the waveform: stopped until its release.
     touching: Option<u64>,
+    /// The disk stream used while its full decoded waveform loads.
+    stream: Option<std::sync::Arc<PreviewStream>>,
     plays: Vec<Play>,
 }
 
@@ -182,6 +201,7 @@ impl SampleStrip {
             wave: None,
             playing: None,
             touching: None,
+            stream: None,
             plays: Vec::new(),
         };
         if wave.is_some() {
@@ -194,6 +214,24 @@ impl SampleStrip {
     fn play(&mut self, from: usize) {
         self.playing = Some((None, from));
         self.plays.push(Play::From(from));
+    }
+
+    /// Starts a pick's disk stream as soon as its first frames are ready.
+    pub fn play_stream(&mut self, stream: std::sync::Arc<PreviewStream>) {
+        self.stream = Some(std::sync::Arc::clone(&stream));
+        self.playing = Some((None, 0));
+        self.plays.push(Play::Streaming(stream));
+    }
+
+    /// Updates the waveform when decoding finishes without restarting a stream already in progress.
+    pub fn set_wave(&mut self, wave: Option<Waveform>) {
+        self.wave = wave;
+        if self.wave.is_some() {
+            let streamed = self.stream.take().is_some();
+            if !streamed && self.playing.is_none() {
+                self.play(0);
+            }
+        }
     }
 
     /// Stops it, if it plays (a refresh, a new pick, the picker closing).
@@ -215,7 +253,11 @@ impl SampleStrip {
     /// The frame it is at, at `now` seconds; `None` while stopped.
     fn position(&self, now: f64) -> Option<f64> {
         let (since, from) = self.playing?;
-        let rate = self.wave.as_ref()?.data.sample_rate;
+        let rate = self
+            .wave
+            .as_ref()
+            .map(|wave| wave.data.sample_rate)
+            .or_else(|| self.stream.as_ref().map(|stream| stream.sample_rate()))?;
         Some(from as f64 + (now - since.unwrap_or(now)).max(0.0) * f64::from(rate))
     }
 
@@ -260,14 +302,15 @@ impl SampleStrip {
             text,
             5,
         );
-        let Some(wave) = self.wave.clone() else {
-            return;
-        };
         if let Some((since @ None, _)) = &mut self.playing {
             *since = Some(now);
         }
-        let frames = wave.data.frames();
-        if self.position(now).is_some_and(|at| at >= frames as f64) {
+        let frames = self
+            .wave
+            .as_ref()
+            .map(|wave| wave.data.frames())
+            .or_else(|| self.stream.as_ref().map(|stream| stream.frames()));
+        if frames.is_some_and(|frames| self.position(now).is_some_and(|at| at >= frames as f64)) {
             // It ended: the player stopped by itself.
             self.playing = None;
         }
@@ -282,10 +325,31 @@ impl SampleStrip {
         if button.clicked() || key {
             match self.playing.is_some() {
                 true => self.stop(),
+                false if self.wave.is_none() => {
+                    if let Some(stream) = self.stream.clone() {
+                        self.play_stream(stream);
+                    }
+                }
                 false => self.play(0),
             }
         }
 
+        let Some(wave) = self.wave.clone() else {
+            if let (Some(position), Some(stream)) = (self.position(now), self.stream.as_ref()) {
+                let label = clock(position / f64::from(stream.sample_rate()));
+                truncated(
+                    &painter,
+                    progress,
+                    Align2::RIGHT_CENTER,
+                    &label,
+                    font,
+                    text,
+                    5,
+                );
+            }
+            return;
+        };
+        let frames = wave.data.frames();
         let wave_id = id.with("sample wave");
         ui.interact(wave_rect, wave_id, Sense::click_and_drag());
         for step in fingers(ui, wave_id) {

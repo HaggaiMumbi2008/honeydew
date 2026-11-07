@@ -37,6 +37,7 @@ use honeydew_audio::note_effects::{LiveNoteEvent, NoteEffectError, NoteEffectTra
 use honeydew_audio::playback::AudioPlayback;
 use honeydew_audio::playback::{PlaybackChannel, PlaybackError};
 use honeydew_audio::sample::SampleData;
+use honeydew_audio::stream::PreviewStream;
 use honeydew_audio::{MeterSnapshot, ProcessContext};
 use input::Monitor;
 use prepare::{Action, KIT, ParamTimeline, ScheduledAction, beat_frame};
@@ -1157,7 +1158,14 @@ impl AudioRenderer for SongAudioEngine {
     /// go of it ([`crate::audio_link::AudioLink::poll`]), so this is a count only.
     fn preview(&mut self, sample: Option<(Arc<SampleData>, usize)>) {
         let rate = self.sample_rate;
+        self.preview = None;
         self.preview = sample.map(|(data, from)| preview::Preview::new(data, from, rate));
+    }
+
+    fn preview_stream(&mut self, sample: Option<Arc<PreviewStream>>) {
+        let rate = self.sample_rate;
+        self.preview = None;
+        self.preview = sample.map(|sample| preview::Preview::streaming(sample, 0, rate));
     }
 
     fn set_live_lane(&mut self, channel: usize, notes: bool) {

@@ -21,30 +21,33 @@
 //!   is there, its folders first at the root as every factory folder is. Ours list in index order (a factory folder
 //!   keeps it). The pick sets the module's `CSTM` `PATH`.
 //!
-//! Every picker stays open after a pick, which applies once it is decoded and shows the sample strip, playing the file
-//! once on the preview player (not the channel); the X, a click outside or Escape closes it and keeps the last pick. A
-//! pad's or a clip's pick makes no undo step; the audio track's browse makes one, its clip. A module's sample
-//! ([`show_module`]) closes on a pick, as the 3x Osc's custom-sample pick does, with no strip: a final edit; the rack
-//! is not in its step, but a Slicer's AUTO clip is. Playing the sample in the song is the engine's: a slot with a path
-//! plays its file, whatever its folder.
+//! Every picker stays open after a pick, which applies once it is decoded and shows the sample strip. A disk-backed PCM
+//! WAV or FLAC starts playing from its in-memory head while the full decode continues; other formats play once decoded.
+//! The preview goes to the preview player (not the channel); the X, a click outside or Escape closes it and keeps the
+//! last pick. A pad's or a clip's pick makes no undo step; the audio track's browse makes one, its clip. A module's
+//! sample ([`show_module`]) closes on a pick, as the 3x Osc's custom-sample pick does, with no strip: a final edit; the
+//! rack is not in its step, but a Slicer's AUTO clip is. Playing the sample in the song is the engine's: a slot with a
+//! path plays its file, whatever its folder.
 //!
 //! A pick decodes on the preset picker's worker ([`decode_pick`]), which reads the file from disk on the desktop (the
 //! web's copies are read at the pick), into a cache of its own that the app's takes when the pick applies: a pad's
 //! `STR1` and a clip's SYNC stretch render there too, and a Slicer's loop is sliced there, so the engine build that
 //! follows decodes, renders and slices nothing. Meanwhile the picked row pulses `LOADING...` (as the preset picker's)
-//! and the strip shows the file's name only, its play button, waveform and progress label disabled or hidden; a new
-//! pick replaces the one decoding, whose result is dropped; a close waits for it, drawing nothing and taking every
-//! click (closing never reverts a pick), and so does a module's picker, which closes on its pick. On the web, which has
-//! no threads, the decode runs at the pick and lands in its own frame, as before.
+//! and the strip shows the file's name; supported disk samples can already play from their stream head while the
+//! waveform finishes decoding. A new pick replaces the one decoding, whose result is dropped; a close waits for it,
+//! drawing nothing and taking every click (closing never reverts a pick), and so does a module's picker, which closes on
+//! its pick. On the web, which has no threads or disk stream, the decode runs at the pick and lands in its own frame.
 //!
 //! [`ProjectFiles::sample_library`]: crate::project_files::ProjectFiles::sample_library
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 use honeydew_audio::device::AudioCommand;
 use honeydew_audio::sample::decode;
+use honeydew_audio::stream::PreviewStream;
 
 use super::preset_picker::{WORKER_LOST, block, outcome, spawn};
 use super::{AppCtx, Nav, drum_editor};
@@ -67,6 +70,12 @@ use crate::ui::sample_row;
 /// The picker's root title (the side panel's titles name what they list, as `Drumsets` and `Instruments` do).
 pub const TITLE: &str = "Samples";
 
+struct Loading {
+    path: PathBuf,
+    done: Receiver<Decoded>,
+    preview: Receiver<Arc<PreviewStream>>,
+}
+
 /// The open picker. It starts afresh on each opening, however it was last closed.
 #[derive(Default)]
 pub struct State {
@@ -82,8 +91,8 @@ pub struct State {
     changes: u64,
     /// The playlist audio-track picker's clip, by id in its lane, once its first pick made it.
     made: Option<u32>,
-    /// A pick decoding on the worker ([`decode_pick`]), by its path.
-    loading: Option<(PathBuf, Receiver<Decoded>)>,
+    /// A pick decoding on the worker ([`decode_pick`]), with its optional early disk-stream preview.
+    loading: Option<Loading>,
     /// The picker was closed while its pick decodes: it stays, drawing nothing and taking every click, until the pick
     /// lands.
     closing: bool,
@@ -258,9 +267,9 @@ enum Shown {
 /// Shows the picker (a fresh one is `make`'s), modal, over the left of the screen, listing
 /// [`ProjectFiles::sample_library`]: `Import` asks for a file, which it lists once it is in. A pick decodes on the
 /// worker (as a 3x Osc table with `shape`), with what it goes `into` (of the song, the file and the files) made ready
-/// there too, its row pulsing, and is [`Shown::Picked`] once it lands. With `strip`, it shows the sample strip, which
-/// plays it on the preview player ([`preview`]) once decoded; without (a module's sample), the picker closes on the
-/// pick, waiting for it.
+/// there too, its row pulsing, and is [`Shown::Picked`] once it lands. With `strip`, supported disk samples start on the
+/// preview player from their stream head while decoding continues; other formats play after decoding. Without (a
+/// module's sample), the picker closes on the pick, waiting for it.
 fn pick(
     state: &mut State,
     ui: &egui::Ui,
@@ -298,12 +307,31 @@ fn pick(
         Some(PickerAction::Pick(path)) => {
             let (key, read) = (sample_key(files, &path), pick_bytes(files, &path));
             let into = into(app.song, &path, files);
+            let stream_path = if strip {
+                sample_cache::disk_locator(files)
+                    .zip(module_path(files, &path))
+                    .and_then(|(locate, key)| locate(&key))
+            } else {
+                None
+            };
+            let (preview_tx, preview) = mpsc::channel();
             // It replaces a pick still decoding, whose result is dropped.
-            let done = spawn(move || decode_pick(key, read(), shape, into));
+            let done = spawn(move || {
+                if let Some(path) = stream_path
+                    && let Some(stream) = PreviewStream::open(&path)
+                {
+                    let _ = preview_tx.send(stream);
+                }
+                decode_pick(key, read(), shape, into)
+            });
             if let (true, Some(picker)) = (strip, &mut state.picker) {
                 show_strip(picker, &path, None);
             }
-            state.loading = Some((path, done));
+            state.loading = Some(Loading {
+                path,
+                done,
+                preview,
+            });
             if !strip {
                 // A module's sample closes on the pick, as the 3x Osc's custom-sample pick does.
                 close_waiting(state, app.audio);
@@ -311,7 +339,17 @@ fn pick(
         }
         Some(PickerAction::Default | PickerAction::Back) | None => {}
     }
-    let arrived = match state.loading.as_ref().map(|(_, done)| done.try_recv()) {
+    let streaming = state.loading.as_mut().and_then(|loading| {
+        match loading.preview.try_recv() {
+            Ok(stream) => Some(stream),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        }
+    });
+    if let (Some(stream), Some(picker)) = (streaming, &mut state.picker) {
+        picker.play_sample_stream(stream);
+        preview(picker, app.audio);
+    }
+    let arrived = match state.loading.as_ref().map(|loading| loading.done.try_recv()) {
         None => None,
         Some(Err(TryRecvError::Empty)) => {
             match state.closing {
@@ -326,13 +364,13 @@ fn pick(
                 wave: None,
                 error: Some(WORKER_LOST.into()),
             };
-            let (path, _) = state.loading.take().expect("loading");
-            Some((path, done.unwrap_or_else(lost)))
+            let loading = state.loading.take().expect("loading");
+            Some((loading.path, done.unwrap_or_else(lost)))
         }
     };
     if let Some(picker) = &mut state.picker {
         if let (true, Some((path, decoded))) = (strip, &arrived) {
-            show_strip(picker, path, decoded.wave.clone());
+            update_strip(picker, path, decoded.wave.clone());
         }
         preview(picker, app.audio);
     }
@@ -367,17 +405,24 @@ pub(super) fn show_strip(picker: &mut PresetPicker, path: &Path, wave: Option<Wa
     picker.set_sample(SampleStrip::new(name.into_owned(), wave));
 }
 
+/// Updates the strip after decoding without restarting a stream that has already started.
+fn update_strip(picker: &mut PresetPicker, path: &Path, wave: Option<Waveform>) {
+    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+    picker.update_sample(name.into_owned(), wave);
+}
+
 /// Sends what `picker`'s sample strip asks of the preview player.
 pub(super) fn preview(picker: &mut PresetPicker, audio: &mut AudioLink) {
     for play in picker.take_plays() {
-        let sample = match play {
-            Play::From(from) => match picker.sample_data() {
-                Some(data) => Some((data, from)),
-                None => continue,
-            },
-            Play::Stop => None,
-        };
-        audio.send(AudioCommand::Preview(sample));
+        match play {
+            Play::From(from) => {
+                if let Some(data) = picker.sample_data() {
+                    audio.send(AudioCommand::Preview(Some((data, from))));
+                }
+            }
+            Play::Streaming(stream) => audio.send(AudioCommand::PreviewStream(Some(stream))),
+            Play::Stop => audio.send(AudioCommand::Preview(None)),
+        }
     }
 }
 

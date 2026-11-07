@@ -11,7 +11,9 @@ use honeydew_audio::instrument::Instrument;
 use honeydew_audio::sample::{SampleData, decode};
 use honeydew_audio::sfz::parse;
 use honeydew_audio::soundfont::{SoundFont, SoundFontPlayer, VOICES};
-use honeydew_audio::stream::{Pcm, STREAM_VOICES, Source, Streamed, Streamer, head_frames};
+use honeydew_audio::stream::{
+    Pcm, PreviewStream, STREAM_VOICES, Source, Streamed, Streamer, head_frames,
+};
 
 const RATE: u32 = 48_000;
 
@@ -236,4 +238,33 @@ fn a_whole_decode_and_a_stream_agree_on_a_wav_too() {
     let whole: SampleData = decode(&bytes).unwrap();
     let streamed = Streamed::new(Source::open(&path).unwrap(), &[0]).unwrap();
     assert_eq!(streamed.whole().unwrap(), whole);
+}
+
+#[test]
+fn a_preview_stream_starts_from_its_head_while_the_rest_streams() {
+    let path = long_flac("preview.flac", 3);
+    let whole = decode(&std::fs::read(&path).unwrap()).unwrap();
+    let stream = PreviewStream::open(&path).expect("a disk FLAC streams");
+    stream.start(0);
+
+    for frame in [0, 100, head_frames(RATE) - 2] {
+        let actual = stream.frame(frame).expect("the sample head is ready");
+        let expected = whole.read(frame as f64);
+        assert!((actual.0 - expected.0).abs() < 1e-6);
+        assert!((actual.1 - expected.1).abs() < 1e-6);
+    }
+
+    let frame = RATE as usize;
+    let mut actual = None;
+    for _ in 0..100 {
+        actual = stream.frame(frame);
+        if actual.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let actual = actual.expect("the streamer fills frames beyond the head");
+    let expected = whole.read(frame as f64);
+    assert!((actual.0 - expected.0).abs() < 1e-6);
+    assert!((actual.1 - expected.1).abs() < 1e-6);
 }
