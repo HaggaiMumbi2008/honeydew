@@ -13,7 +13,7 @@ pub mod builtin;
 mod engine;
 pub(crate) use engine::{begin_callback, lock_stats};
 mod host;
-#[cfg(plugin_host)]
+#[cfg(any(plugin_host, target_os = "android"))]
 pub mod scan;
 mod window;
 pub use host::*;
