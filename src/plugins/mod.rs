@@ -7,7 +7,7 @@
 //!
 //! Windows plugins on Linux: yabridge and its fork vstbridge wrap them as native Linux VST2 and VST3 plugins in
 //! `~/.vst/yabridge` and `~/.vst3/yabridge`, which the default search folders include ([`scan::default_folders`]), so
-//! they load like any Linux plugin.
+//! they load like any Linux plugin. .clap should work bro!
 
 pub mod builtin;
 mod engine;
